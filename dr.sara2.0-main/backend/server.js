@@ -13,31 +13,43 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 // ===================================
-// Database Connection
+// Database Connection (Fixed for SSL/Supabase on Render)
 // ===================================
-const pool = process.env.DATABASE_URL
-  ? new Pool({
-      connectionString: process.env.DATABASE_URL,
-      ssl: {
-        rejectUnauthorized: false // يسمح بالاتصال المشفّر بدون التدقيق في شهادة SSL الذاتية
-      }
-    })
-  : new Pool({
-      host: process.env.DB_HOST || 'localhost',
-      port: process.env.DB_PORT || 5432,
-      database: process.env.DB_NAME || 'drsara_db',
-      user: process.env.DB_USER || 'postgres',
-      password: process.env.DB_PASSWORD,
-      ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false,
-    });
+let poolConfig = {};
 
-pool.connect((err, client, release) => {
-    if (err) {
-        console.error('❌ Database connection error:', err.message);
-    } else {
-        console.log('✅ Database connected successfully');
-        release();
+if (process.env.DATABASE_URL) {
+  poolConfig = {
+    connectionString: process.env.DATABASE_URL,
+    ssl: {
+      rejectUnauthorized: false // يتجاوز التحقق من شهادة SSL الذاتية لـ Supabase
     }
+  };
+} else {
+  poolConfig = {
+    host: process.env.DB_HOST || 'localhost',
+    port: process.env.DB_PORT || 5432,
+    database: process.env.DB_NAME || 'drsara_db',
+    user: process.env.DB_USER || 'postgres',
+    password: process.env.DB_PASSWORD,
+    ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false,
+  };
+}
+
+const pool = new Pool(poolConfig);
+
+// معالجة الأخطاء غير المتوقعة في الاتصال لضمان عدم توقف الخادم
+pool.on('error', (err) => {
+  console.error('❌ Unexpected database error on idle client:', err.message);
+});
+
+// تجربة الاتصال المبدئي
+pool.connect((err, client, release) => {
+  if (err) {
+    console.error('❌ Database connection error:', err.message);
+  } else {
+    console.log('✅ Database connected successfully');
+    release();
+  }
 });
 
 // ===================================
@@ -613,37 +625,10 @@ app.get('/api/admin/dashboard/stats', authenticateToken, async (req, res) => {
     } catch (error) { res.status(500).json({ error: 'Server error' }); }
 });
 
-// ===================================
-// CUSTOMERS ROUTES
-// ===================================
-app.get('/api/admin/customers', authenticateToken, async (req, res) => {
-    try {
-        const { page = 1, limit = 20, search } = req.query;
-        const offset = (page - 1) * limit;
-        let conditions = ['1=1'];
-        const params = [];
-        let pc = 1;
-
-        if (search) {
-            conditions.push(`(first_name ILIKE $${pc} OR last_name ILIKE $${pc} OR email ILIKE $${pc} OR phone ILIKE $${pc})`);
-            params.push(`%${search}%`);
-            pc++;
-        }
-
-        const where = 'WHERE ' + conditions.join(' AND ');
-        const result = await pool.query(`SELECT * FROM customers ${where} ORDER BY created_at DESC LIMIT $${pc} OFFSET $${pc + 1}`, [...params, limit, offset]);
-        const count = await pool.query(`SELECT COUNT(*) FROM customers ${where}`, params);
-
-        res.json({ customers: result.rows, total: parseInt(count.rows[0].count), page: parseInt(page), totalPages: Math.ceil(count.rows[0].count / limit) });
-    } catch (error) {
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
-// ===================================
-// SERVER INITIALIZATION
-// ===================================
+// Start Server
 app.listen(PORT, () => {
+  console.log(`🚀 Dr. Sara Backend running on port ${PORT}`);
+});
     console.log(`🚀 Dr. Sara Backend running on port ${PORT}`);
     console.log(`✅ Health check: http://localhost:${PORT}/health`);
 });
