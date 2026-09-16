@@ -2,7 +2,7 @@ import React, { createContext, useContext, useState, useEffect } from 'react';
 import { useToast } from '@/components/ui/use-toast';
 
 const AuthContext = createContext();
-const API = '/api';
+const API = import.meta.env.VITE_API_URL || '/api';
 
 export const useAuth = () => {
   const context = useContext(AuthContext);
