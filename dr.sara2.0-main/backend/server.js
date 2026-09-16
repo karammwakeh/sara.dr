@@ -13,13 +13,12 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 // ===================================
-// ===================================
 // Database Connection
 // ===================================
 const pool = process.env.DATABASE_URL
   ? new Pool({
       connectionString: process.env.DATABASE_URL,
-      ssl: { rejectUnauthorized: false }
+      ssl: { rejectUnauthorized: false } // تمكين الاتصال وتجاوز رفض الشهادة الذاتية
     })
   : new Pool({
       host: process.env.DB_HOST || 'localhost',
@@ -612,72 +611,37 @@ app.get('/api/admin/dashboard/stats', authenticateToken, async (req, res) => {
     } catch (error) { res.status(500).json({ error: 'Server error' }); }
 });
 
+// ===================================
+// CUSTOMERS ROUTES
+// ===================================
 app.get('/api/admin/customers', authenticateToken, async (req, res) => {
     try {
-        const { page = 1, limit = 20 } = req.query;
+        const { page = 1, limit = 20, search } = req.query;
         const offset = (page - 1) * limit;
-        const result = await pool.query('SELECT * FROM customers ORDER BY created_at DESC LIMIT $1 OFFSET $2', [limit, offset]);
-        const count = await pool.query('SELECT COUNT(*) FROM customers');
-        res.json({ customers: result.rows, total: parseInt(count.rows[0].count) });
-    } catch (error) { res.status(500).json({ error: 'Server error' }); }
-});
+        let conditions = ['1=1'];
+        const params = [];
+        let pc = 1;
 
-// ===================================
-// PAYMENT ROUTES (Moyasar - optional)
-// ===================================
-app.post('/api/payments/create', async (req, res) => {
-    try {
-        if (!process.env.MOYASAR_API_KEY || process.env.MOYASAR_API_KEY.includes('YOUR_KEY')) {
-            return res.status(503).json({ error: 'Payment gateway not configured. Contact admin.' });
+        if (search) {
+            conditions.push(`(first_name ILIKE $${pc} OR last_name ILIKE $${pc} OR email ILIKE $${pc} OR phone ILIKE $${pc})`);
+            params.push(`%${search}%`);
+            pc++;
         }
-        const { amount, currency = 'SAR', description, callback_url, metadata } = req.body;
-        const axios = require('axios');
-        const response = await axios.post('https://api.moyasar.com/v1/payments', { amount: Math.round(amount * 100), currency, description, callback_url: callback_url || `${process.env.FRONTEND_URL}/order-success`, source: { type: 'creditcard' }, metadata }, { auth: { username: process.env.MOYASAR_API_KEY, password: '' } });
-        res.json({ payment_id: response.data.id, payment_url: response.data.source?.transaction_url, status: response.data.status });
+
+        const where = 'WHERE ' + conditions.join(' AND ');
+        const result = await pool.query(`SELECT * FROM customers ${where} ORDER BY created_at DESC LIMIT $${pc} OFFSET $${pc + 1}`, [...params, limit, offset]);
+        const count = await pool.query(`SELECT COUNT(*) FROM customers ${where}`, params);
+
+        res.json({ customers: result.rows, total: parseInt(count.rows[0].count), page: parseInt(page), totalPages: Math.ceil(count.rows[0].count / limit) });
     } catch (error) {
-        res.status(500).json({ error: 'فشل إنشاء جلسة الدفع' });
+        res.status(500).json({ error: 'Server error' });
     }
 });
 
-app.get('/api/payments/verify/:payment_id', async (req, res) => {
-    try {
-        if (!process.env.MOYASAR_API_KEY || process.env.MOYASAR_API_KEY.includes('YOUR_KEY')) return res.status(503).json({ error: 'Payment gateway not configured' });
-        const axios = require('axios');
-        const response = await axios.get(`https://api.moyasar.com/v1/payments/${req.params.payment_id}`, { auth: { username: process.env.MOYASAR_API_KEY, password: '' } });
-        const payment = response.data;
-        if (payment.status === 'paid' && payment.metadata?.order_id) {
-            await pool.query(`UPDATE orders SET payment_status='paid', payment_transaction_id=$1, paid_at=NOW(), updated_at=NOW() WHERE id=$2`, [req.params.payment_id, payment.metadata.order_id]);
-        }
-        res.json({ status: payment.status, amount: payment.amount / 100, currency: payment.currency, order_id: payment.metadata?.order_id });
-    } catch (error) { res.status(500).json({ error: 'فشل التحقق من الدفع' }); }
-});
-
-app.post('/api/payments/webhook', async (req, res) => {
-    try {
-        const { type, data } = req.body;
-        if (type === 'payment.paid' && data?.metadata?.order_id) {
-            await pool.query(`UPDATE orders SET payment_status='paid', payment_transaction_id=$1, paid_at=NOW(), status='processing', updated_at=NOW() WHERE id=$2`, [data.id, data.metadata.order_id]);
-        }
-        res.json({ received: true });
-    } catch (error) { res.status(500).json({ error: 'Webhook failed' }); }
-});
-
 // ===================================
-// Error Handlers
-// ===================================
-app.use((err, req, res, next) => {
-    console.error('Error:', err);
-    if (err.code === 'LIMIT_FILE_SIZE') return res.status(400).json({ error: 'File too large. Max 5MB.' });
-    res.status(500).json({ error: 'Internal server error', details: err.message });
-});
-
-app.use((req, res) => res.status(404).json({ error: `Route not found: ${req.method} ${req.path}` }));
-
-// ===================================
-// Start Server
+// SERVER INITIALIZATION
 // ===================================
 app.listen(PORT, () => {
-    console.log(`\n🚀 Dr. Sara Backend`);
-    console.log(`✅ http://localhost:${PORT}`);
-    console.log(`✅ Health: http://localhost:${PORT}/health\n`);
+    console.log(`🚀 Dr. Sara Backend running on port ${PORT}`);
+    console.log(`✅ Health check: http://localhost:${PORT}/health`);
 });
