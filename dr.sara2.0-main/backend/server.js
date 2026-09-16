@@ -18,7 +18,9 @@ const PORT = process.env.PORT || 5000;
 const pool = process.env.DATABASE_URL
   ? new Pool({
       connectionString: process.env.DATABASE_URL,
-      ssl: { rejectUnauthorized: false } // تمكين الاتصال وتجاوز رفض الشهادة الذاتية
+      ssl: {
+        rejectUnauthorized: false // يسمح بالاتصال المشفّر بدون التدقيق في شهادة SSL الذاتية
+      }
     })
   : new Pool({
       host: process.env.DB_HOST || 'localhost',
