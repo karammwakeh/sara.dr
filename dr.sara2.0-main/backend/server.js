@@ -1,4 +1,4 @@
-// server.js - Backend API Server (Fixed & Complete)
+// server.js - Backend API Server (Fixed Syntax & Complete)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -13,7 +13,7 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 // ===================================
-// Database Connection (Fixed for SSL/Supabase on Render)
+// Database Connection (Fixed SSL for Render & Supabase)
 // ===================================
 let poolConfig = {};
 
@@ -21,7 +21,7 @@ if (process.env.DATABASE_URL) {
   poolConfig = {
     connectionString: process.env.DATABASE_URL,
     ssl: {
-      rejectUnauthorized: false // يتجاوز التحقق من شهادة SSL الذاتية لـ Supabase
+      rejectUnauthorized: false
     }
   };
 } else {
@@ -37,12 +37,10 @@ if (process.env.DATABASE_URL) {
 
 const pool = new Pool(poolConfig);
 
-// معالجة الأخطاء غير المتوقعة في الاتصال لضمان عدم توقف الخادم
 pool.on('error', (err) => {
   console.error('❌ Unexpected database error on idle client:', err.message);
 });
 
-// تجربة الاتصال المبدئي
 pool.connect((err, client, release) => {
   if (err) {
     console.error('❌ Database connection error:', err.message);
@@ -62,15 +60,12 @@ app.use(cors({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Ensure uploads directory exists
 const uploadsDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 app.use('/uploads', express.static(uploadsDir));
 
-// Health check
 app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date() }));
 
-// File Upload
 const storage = multer.diskStorage({
     destination: (req, file, cb) => cb(null, uploadsDir),
     filename: (req, file, cb) => cb(null, Date.now() + '-' + Math.round(Math.random() * 1E9) + path.extname(file.originalname))
@@ -609,7 +604,6 @@ app.get('/api/admin/stats', authenticateToken, async (req, res) => {
     }
 });
 
-// Support old dashboard route
 app.get('/api/admin/dashboard/stats', authenticateToken, async (req, res) => {
     try {
         const [revenue, monthRevenue, ordersCount, pendingOrders, productsCount, lowStock, customersCount] = await Promise.all([
@@ -621,14 +615,23 @@ app.get('/api/admin/dashboard/stats', authenticateToken, async (req, res) => {
             pool.query("SELECT COUNT(*) as low_stock FROM products WHERE stock_quantity <= low_stock_threshold AND track_inventory=true"),
             pool.query("SELECT COUNT(*) as total_customers FROM customers"),
         ]);
-        res.json({ total_revenue: parseFloat(revenue.rows[0].total_revenue), month_revenue: parseFloat(monthRevenue.rows[0].month_revenue), total_orders: parseInt(ordersCount.rows[0].total_orders), pending_orders: parseInt(pendingOrders.rows[0].pending_orders), total_products: parseInt(productsCount.rows[0].total_products), low_stock_count: parseInt(lowStock.rows[0].low_stock), total_customers: parseInt(customersCount.rows[0].total_customers) });
-    } catch (error) { res.status(500).json({ error: 'Server error' }); }
+        res.json({
+            total_revenue: parseFloat(revenue.rows[0].total_revenue),
+            month_revenue: parseFloat(monthRevenue.rows[0].month_revenue),
+            total_orders: parseInt(ordersCount.rows[0].total_orders),
+            pending_orders: parseInt(pendingOrders.rows[0].pending_orders),
+            total_products: parseInt(productsCount.rows[0].total_products),
+            low_stock_count: parseInt(lowStock.rows[0].low_stock),
+            total_customers: parseInt(customersCount.rows[0].total_customers)
+        });
+    } catch (error) {
+        res.status(500).json({ error: 'Server error' });
+    }
 });
 
+// ===================================
 // Start Server
+// ===================================
 app.listen(PORT, () => {
-  console.log(`🚀 Dr. Sara Backend running on port ${PORT}`);
-});
     console.log(`🚀 Dr. Sara Backend running on port ${PORT}`);
-    console.log(`✅ Health check: http://localhost:${PORT}/health`);
 });
