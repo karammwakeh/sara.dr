@@ -30,8 +30,21 @@ const JWT_SECRET = process.env.JWT_SECRET;
 // ===================================
 let poolConfig;
 if (process.env.DATABASE_URL) {
+    // Strip sslmode from the URL itself — recent pg-connection-string
+    // versions treat sslmode=require/prefer/verify-ca as verify-full,
+    // which rejects Render's self-signed cert regardless of the
+    // explicit `ssl` option below. Let the `ssl` object be the only
+    // source of truth.
+    let cleanUrl;
+    try {
+        const u = new URL(process.env.DATABASE_URL);
+        u.searchParams.delete('sslmode');
+        cleanUrl = u.toString();
+    } catch {
+        cleanUrl = process.env.DATABASE_URL;
+    }
     poolConfig = {
-        connectionString: process.env.DATABASE_URL,
+        connectionString: cleanUrl,
         ssl: { rejectUnauthorized: false },
     };
 } else {
