@@ -1,4 +1,4 @@
-// server.js - Backend API Server (Fixed Syntax & Complete)
+// server.js - Backend API Server (Fixed Syntax & SSL Connection)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -18,8 +18,12 @@ const PORT = process.env.PORT || 5000;
 let poolConfig = {};
 
 if (process.env.DATABASE_URL) {
+  let connectionString = process.env.DATABASE_URL;
+  if (!connectionString.includes('sslmode=')) {
+    connectionString += (connectionString.includes('?') ? '&' : '?') + 'sslmode=no-verify';
+  }
   poolConfig = {
-    connectionString: process.env.DATABASE_URL,
+    connectionString: connectionString,
     ssl: {
       rejectUnauthorized: false
     }
@@ -31,7 +35,7 @@ if (process.env.DATABASE_URL) {
     database: process.env.DB_NAME || 'drsara_db',
     user: process.env.DB_USER || 'postgres',
     password: process.env.DB_PASSWORD,
-    ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false,
+    ssl: { rejectUnauthorized: false }
   };
 }
 
