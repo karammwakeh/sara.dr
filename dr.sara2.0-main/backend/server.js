@@ -1,7 +1,9 @@
-// server.js - Backend API Server (Fixed Syntax & SSL Connection)
+// server.js - Backend API Server (Hardened for Production)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
+const axios = require('axios');
 const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -13,74 +15,126 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 // ===================================
-// Database Connection (Fixed SSL for Render & Supabase)
+// Required secrets — fail fast instead of silently falling back
 // ===================================
-let poolConfig = {};
+const REQUIRED_ENV = ['JWT_SECRET'];
+const missing = REQUIRED_ENV.filter((k) => !process.env[k]);
+if (missing.length) {
+    console.error(`❌ Missing required env vars: ${missing.join(', ')}`);
+    process.exit(1);
+}
+const JWT_SECRET = process.env.JWT_SECRET;
 
+// ===================================
+// Database Connection (SSL for Render / Supabase / managed Postgres)
+// ===================================
+let poolConfig;
 if (process.env.DATABASE_URL) {
-  let connectionString = process.env.DATABASE_URL;
-  if (!connectionString.includes('sslmode=')) {
-    connectionString += (connectionString.includes('?') ? '&' : '?') + 'sslmode=no-verify';
-  }
-  poolConfig = {
-    connectionString: connectionString,
-    ssl: {
-      rejectUnauthorized: false
-    }
-  };
+    poolConfig = {
+        connectionString: process.env.DATABASE_URL,
+        ssl: { rejectUnauthorized: false },
+    };
 } else {
-  poolConfig = {
-    host: process.env.DB_HOST || 'localhost',
-    port: process.env.DB_PORT || 5432,
-    database: process.env.DB_NAME || 'drsara_db',
-    user: process.env.DB_USER || 'postgres',
-    password: process.env.DB_PASSWORD,
-    ssl: { rejectUnauthorized: false }
-  };
+    poolConfig = {
+        host: process.env.DB_HOST || 'localhost',
+        port: process.env.DB_PORT || 5432,
+        database: process.env.DB_NAME || 'drsara_db',
+        user: process.env.DB_USER || 'postgres',
+        password: process.env.DB_PASSWORD,
+        ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false,
+    };
 }
 
 const pool = new Pool(poolConfig);
 
 pool.on('error', (err) => {
-  console.error('❌ Unexpected database error on idle client:', err.message);
+    // Errors on idle clients must not crash the whole process
+    console.error('❌ Unexpected database error on idle client:', err.message);
 });
 
-pool.connect((err, client, release) => {
-  if (err) {
-    console.error('❌ Database connection error:', err.message);
-  } else {
-    console.log('✅ Database connected successfully');
-    release();
-  }
-});
+let dbReady = false;
+
+async function startServer() {
+    try {
+        const client = await pool.connect();
+        console.log('✅ Database connected successfully');
+        client.release();
+        dbReady = true;
+    } catch (err) {
+        console.error('❌ Database connection error:', err.message);
+        // Fail the deploy loudly instead of serving traffic against a dead pool
+        process.exit(1);
+    }
+
+    app.listen(PORT, () => {
+        console.log(`🚀 Dr. Sara Backend running on port ${PORT}`);
+    });
+}
 
 // ===================================
 // Middleware
 // ===================================
+const allowedOrigins = (process.env.FRONTEND_URL || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+if (allowedOrigins.length === 0) {
+    console.warn('⚠️  FRONTEND_URL is not set — CORS will reject all cross-origin requests.');
+}
+
 app.use(cors({
-    origin: process.env.FRONTEND_URL || '*',
+    origin: allowedOrigins,
     credentials: true,
 }));
-app.use(express.json());
+
+// Capture raw body alongside JSON parsing so the Moyasar webhook can verify
+// the HMAC signature (signature is computed over the exact raw bytes).
+app.use(express.json({
+    verify: (req, res, buf) => { req.rawBody = buf; },
+}));
 app.use(express.urlencoded({ extended: true }));
+
+// Readiness gate — reject requests until the DB pool is confirmed live
+app.use((req, res, next) => {
+    if (!dbReady && req.path !== '/health') {
+        return res.status(503).json({ error: 'Service starting up, try again shortly' });
+    }
+    next();
+});
 
 const uploadsDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 app.use('/uploads', express.static(uploadsDir));
 
-app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date() }));
+app.get('/health', (req, res) => res.json({ status: 'ok', db: dbReady, timestamp: new Date() }));
 
+// File Upload — check both mimetype and extension (mimetype alone is client-controlled)
+const ALLOWED_IMAGE_EXT = /\.(jpe?g|png|gif|webp)$/i;
+const ALLOWED_IMAGE_MIME = /^image\/(jpeg|png|gif|webp)$/;
 const storage = multer.diskStorage({
     destination: (req, file, cb) => cb(null, uploadsDir),
-    filename: (req, file, cb) => cb(null, Date.now() + '-' + Math.round(Math.random() * 1E9) + path.extname(file.originalname))
+    filename: (req, file, cb) => cb(null, Date.now() + '-' + Math.round(Math.random() * 1e9) + path.extname(file.originalname).toLowerCase()),
 });
 const upload = multer({
     storage,
     limits: { fileSize: 5 * 1024 * 1024 },
     fileFilter: (req, file, cb) => {
-        /jpeg|jpg|png|gif|webp/.test(file.mimetype) ? cb(null, true) : cb(new Error('Images only'));
-    }
+        if (ALLOWED_IMAGE_MIME.test(file.mimetype) && ALLOWED_IMAGE_EXT.test(file.originalname)) {
+            return cb(null, true);
+        }
+        cb(new Error('Images only (jpeg, png, gif, webp)'));
+    },
 });
+
+// ===================================
+// Helpers
+// ===================================
+function safeInt(val, def, lo = 1, hi = 1000) {
+    const n = parseInt(val, 10);
+    if (!Number.isFinite(n) || Number.isNaN(n)) return def;
+    return Math.min(Math.max(n, lo), hi);
+}
 
 // ===================================
 // Auth Middleware
@@ -88,11 +142,18 @@ const upload = multer({
 const authenticateToken = (req, res, next) => {
     const token = req.headers['authorization']?.split(' ')[1];
     if (!token) return res.status(401).json({ error: 'Access denied. No token provided.' });
-    jwt.verify(token, process.env.JWT_SECRET || 'dr-sara-secret-key-2024', (err, decoded) => {
+    jwt.verify(token, JWT_SECRET, (err, decoded) => {
         if (err) return res.status(403).json({ error: 'Invalid or expired token' });
         req.admin = decoded;
         next();
     });
+};
+
+const requireRole = (...roles) => (req, res, next) => {
+    if (!req.admin || !roles.includes(req.admin.role)) {
+        return res.status(403).json({ error: 'Forbidden' });
+    }
+    next();
 };
 
 // ===================================
@@ -111,7 +172,7 @@ app.post('/api/admin/login', async (req, res) => {
 
         const token = jwt.sign(
             { id: admin.id, email: admin.email, role: admin.role, full_name: admin.full_name },
-            process.env.JWT_SECRET || 'dr-sara-secret-key-2024',
+            JWT_SECRET,
             { expiresIn: '24h' }
         );
         res.json({ token, admin: { id: admin.id, email: admin.email, full_name: admin.full_name, role: admin.role } });
@@ -185,7 +246,9 @@ app.delete('/api/admin/categories/:id', authenticateToken, async (req, res) => {
 // ===================================
 app.get('/api/products', async (req, res) => {
     try {
-        const { category, status, search, featured, page = 1, limit = 20 } = req.query;
+        const { category, status, search, featured } = req.query;
+        const page = safeInt(req.query.page, 1);
+        const limit = safeInt(req.query.limit, 20, 1, 100);
         const offset = (page - 1) * limit;
         let conditions = ['1=1'];
         const params = [];
@@ -203,7 +266,7 @@ app.get('/api/products', async (req, res) => {
         );
         const countResult = await pool.query(`SELECT COUNT(*) FROM products p ${where}`, params);
 
-        res.json({ products: result.rows, total: parseInt(countResult.rows[0].count), page: parseInt(page), totalPages: Math.ceil(countResult.rows[0].count / limit) });
+        res.json({ products: result.rows, total: parseInt(countResult.rows[0].count), page, totalPages: Math.ceil(countResult.rows[0].count / limit) });
     } catch (error) {
         console.error('Get products error:', error);
         res.status(500).json({ error: 'Server error', details: error.message });
@@ -245,7 +308,7 @@ app.post('/api/admin/products', authenticateToken, upload.array('images', 5), as
                 status || 'published', JSON.stringify(images)
             ]
         );
-        await pool.query('INSERT INTO activity_logs (admin_id,action,entity_type,entity_id,description) VALUES ($1,$2,$3,$4,$5)', [req.admin.id, 'created', 'product', result.rows[0].id, `Created: ${name_ar}`]).catch(() => { });
+        await pool.query('INSERT INTO activity_logs (admin_id,action,entity_type,entity_id,description) VALUES ($1,$2,$3,$4,$5)', [req.admin.id, 'created', 'product', result.rows[0].id, `Created: ${name_ar}`]).catch(() => {});
         res.status(201).json(result.rows[0]);
     } catch (error) {
         console.error('Create product error:', error);
@@ -272,7 +335,7 @@ app.put('/api/admin/products/:id', authenticateToken, upload.array('images', 5),
     }
 });
 
-app.delete('/api/admin/products/:id', authenticateToken, async (req, res) => {
+app.delete('/api/admin/products/:id', authenticateToken, requireRole('admin', 'super_admin'), async (req, res) => {
     try {
         const product = await pool.query('SELECT name_ar FROM products WHERE id=$1', [req.params.id]);
         if (!product.rows.length) return res.status(404).json({ error: 'Product not found' });
@@ -288,7 +351,9 @@ app.delete('/api/admin/products/:id', authenticateToken, async (req, res) => {
 // ===================================
 app.get('/api/admin/orders', authenticateToken, async (req, res) => {
     try {
-        const { status, page = 1, limit = 20 } = req.query;
+        const { status } = req.query;
+        const page = safeInt(req.query.page, 1);
+        const limit = safeInt(req.query.limit, 20, 1, 100);
         const offset = (page - 1) * limit;
         let conditions = ['1=1'];
         const params = [];
@@ -297,7 +362,7 @@ app.get('/api/admin/orders', authenticateToken, async (req, res) => {
         const where = 'WHERE ' + conditions.join(' AND ');
         const result = await pool.query(`SELECT * FROM orders ${where} ORDER BY created_at DESC LIMIT $${pc} OFFSET $${pc + 1}`, [...params, limit, offset]);
         const count = await pool.query(`SELECT COUNT(*) FROM orders ${where}`, params);
-        res.json({ orders: result.rows, total: parseInt(count.rows[0].count), page: parseInt(page), totalPages: Math.ceil(count.rows[0].count / limit) });
+        res.json({ orders: result.rows, total: parseInt(count.rows[0].count), page, totalPages: Math.ceil(count.rows[0].count / limit) });
     } catch (error) {
         res.status(500).json({ error: 'Server error' });
     }
@@ -330,12 +395,17 @@ app.patch('/api/admin/orders/:id/status', authenticateToken, async (req, res) =>
     }
 });
 
+// Order creation — stock is decremented atomically per-item so two
+// concurrent checkouts can never both succeed on the last unit.
 app.post('/api/orders', async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
         const { customer, items, shipping, payment_method, coupon_code } = req.body;
-        if (!customer || !items?.length) return res.status(400).json({ error: 'Customer info and items required' });
+        if (!customer?.email || !items?.length) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'Customer info and items required' });
+        }
 
         const products = await client.query('SELECT * FROM products WHERE id = ANY($1)', [items.map(i => i.product_id)]);
         const productMap = {};
@@ -345,6 +415,7 @@ app.post('/api/orders', async (req, res) => {
         for (const item of items) {
             const product = productMap[item.product_id];
             if (!product) throw new Error(`Product not found: ${item.product_id}`);
+            if (!item.quantity || item.quantity <= 0) throw new Error(`Invalid quantity for product: ${item.product_id}`);
             subtotal += (product.sale_price || product.price) * item.quantity;
         }
 
@@ -354,22 +425,30 @@ app.post('/api/orders', async (req, res) => {
         if (sm?.free_shipping_threshold && subtotal >= sm.free_shipping_threshold) shippingCost = 0;
 
         let discount = 0;
+        let coupon = null;
         if (coupon_code) {
-            const coupon = await client.query(`SELECT * FROM coupons WHERE UPPER(code)=UPPER($1) AND is_active=true AND (expires_at IS NULL OR expires_at > NOW()) AND (usage_limit IS NULL OR times_used < usage_limit)`, [coupon_code]);
-            if (coupon.rows.length && subtotal >= (coupon.rows[0].minimum_order_amount || 0)) {
-                discount = coupon.rows[0].discount_type === 'percentage' ? subtotal * coupon.rows[0].discount_value / 100 : coupon.rows[0].discount_value;
-                await client.query('UPDATE coupons SET times_used=times_used+1 WHERE id=$1', [coupon.rows[0].id]);
+            const couponResult = await client.query(`SELECT * FROM coupons WHERE UPPER(code)=UPPER($1) AND is_active=true AND (expires_at IS NULL OR expires_at > NOW()) AND (usage_limit IS NULL OR times_used < usage_limit) FOR UPDATE`, [coupon_code]);
+            coupon = couponResult.rows[0];
+            if (coupon && subtotal >= (coupon.minimum_order_amount || 0)) {
+                discount = coupon.discount_type === 'percentage' ? subtotal * coupon.discount_value / 100 : coupon.discount_value;
+                await client.query('UPDATE coupons SET times_used=times_used+1 WHERE id=$1', [coupon.id]);
+            } else {
+                coupon = null;
             }
         }
 
         const tax = (subtotal - discount) * 0.15;
         const total = subtotal + shippingCost - discount + tax;
-        const orderNumber = 'ORD-' + Date.now();
+        const orderNumber = 'ORD-' + Date.now() + '-' + crypto.randomBytes(3).toString('hex');
 
         let customerId;
         const existing = await client.query('SELECT id FROM customers WHERE email=$1', [customer.email]);
-        if (existing.rows.length) { customerId = existing.rows[0].id; }
-        else { const nc = await client.query('INSERT INTO customers (email,phone,first_name,last_name) VALUES ($1,$2,$3,$4) RETURNING id', [customer.email, customer.phone, customer.first_name, customer.last_name]); customerId = nc.rows[0].id; }
+        if (existing.rows.length) {
+            customerId = existing.rows[0].id;
+        } else {
+            const nc = await client.query('INSERT INTO customers (email,phone,first_name,last_name) VALUES ($1,$2,$3,$4) RETURNING id', [customer.email, customer.phone, customer.first_name, customer.last_name]);
+            customerId = nc.rows[0].id;
+        }
 
         const order = await client.query(
             `INSERT INTO orders (order_number,customer_id,customer_email,customer_phone,customer_name,shipping_address,subtotal,shipping_cost,tax,discount,total,coupon_code,status,payment_method,shipping_method,payment_status)
@@ -380,8 +459,22 @@ app.post('/api/orders', async (req, res) => {
         for (const item of items) {
             const p = productMap[item.product_id];
             const price = p.sale_price || p.price;
-            await client.query(`INSERT INTO order_items (order_id,product_id,product_name,product_sku,product_image,price,quantity,subtotal) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-                [order.rows[0].id, item.product_id, p.name_ar, p.sku, p.images?.[0] || null, price, item.quantity, price * item.quantity]);
+
+            // Atomic, race-safe stock decrement: only succeeds if enough stock remains.
+            if (p.track_inventory) {
+                const stockUpdate = await client.query(
+                    'UPDATE products SET stock_quantity = stock_quantity - $1 WHERE id=$2 AND stock_quantity >= $1 RETURNING stock_quantity',
+                    [item.quantity, item.product_id]
+                );
+                if (!stockUpdate.rows.length) {
+                    throw new Error(`الكمية غير متوفرة: ${p.name_ar}`);
+                }
+            }
+
+            await client.query(
+                `INSERT INTO order_items (order_id,product_id,product_name,product_sku,product_image,price,quantity,subtotal) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+                [order.rows[0].id, item.product_id, p.name_ar, p.sku, p.images?.[0] || null, price, item.quantity, price * item.quantity]
+            );
         }
 
         await client.query('COMMIT');
@@ -389,8 +482,10 @@ app.post('/api/orders', async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Create order error:', error);
-        res.status(500).json({ error: 'فشل إنشاء الطلب', details: error.message });
-    } finally { client.release(); }
+        res.status(400).json({ error: error.message || 'فشل إنشاء الطلب' });
+    } finally {
+        client.release();
+    }
 });
 
 app.get('/api/orders/public/:id', async (req, res) => {
@@ -466,7 +561,9 @@ app.post('/api/bookings', async (req, res) => {
 
 app.get('/api/admin/bookings', authenticateToken, async (req, res) => {
     try {
-        const { status, page = 1, limit = 20 } = req.query;
+        const { status } = req.query;
+        const page = safeInt(req.query.page, 1);
+        const limit = safeInt(req.query.limit, 20, 1, 100);
         const offset = (page - 1) * limit;
         let conditions = ['1=1'];
         const params = [];
@@ -543,28 +640,16 @@ app.put('/api/admin/blog/:id', authenticateToken, upload.single('image'), async 
         const image = req.file ? `/uploads/${req.file.filename}` : req.body.existing_image;
         const result = await pool.query(
             `UPDATE blog_posts SET
-        title_ar=$1,
-        excerpt_ar=$2,
-        content_ar=$3,
-        category=$4,
-        status=$5::varchar,
-        image_url=$6,
-        updated_at=NOW(),
-        published_at=
-        CASE
-            WHEN $5::varchar='published' AND published_at IS NULL
-            THEN NOW()
-            ELSE published_at
-        END
-        WHERE id=$7
-        RETURNING *`,
+        title_ar=$1, excerpt_ar=$2, content_ar=$3, category=$4, status=$5::varchar, image_url=$6, updated_at=NOW(),
+        published_at = CASE WHEN $5::varchar='published' AND published_at IS NULL THEN NOW() ELSE published_at END
+        WHERE id=$7 RETURNING *`,
             [title_ar, excerpt_ar, content_ar, category, status, image, req.params.id]
         );
         if (!result.rows.length) return res.status(404).json({ error: 'Post not found' });
         res.json(result.rows[0]);
     } catch (error) {
-        res.status(500).json({ error: 'Server error' });
         console.error(error);
+        res.status(500).json({ error: 'Server error' });
     }
 });
 
@@ -626,16 +711,128 @@ app.get('/api/admin/dashboard/stats', authenticateToken, async (req, res) => {
             pending_orders: parseInt(pendingOrders.rows[0].pending_orders),
             total_products: parseInt(productsCount.rows[0].total_products),
             low_stock_count: parseInt(lowStock.rows[0].low_stock),
-            total_customers: parseInt(customersCount.rows[0].total_customers)
+            total_customers: parseInt(customersCount.rows[0].total_customers),
         });
     } catch (error) {
         res.status(500).json({ error: 'Server error' });
     }
 });
 
-// ===================================
-// Start Server
-// ===================================
-app.listen(PORT, () => {
-    console.log(`🚀 Dr. Sara Backend running on port ${PORT}`);
+app.get('/api/admin/customers', authenticateToken, async (req, res) => {
+    try {
+        const page = safeInt(req.query.page, 1);
+        const limit = safeInt(req.query.limit, 20, 1, 100);
+        const offset = (page - 1) * limit;
+        const result = await pool.query('SELECT * FROM customers ORDER BY created_at DESC LIMIT $1 OFFSET $2', [limit, offset]);
+        const count = await pool.query('SELECT COUNT(*) FROM customers');
+        res.json({ customers: result.rows, total: parseInt(count.rows[0].count) });
+    } catch (error) { res.status(500).json({ error: 'Server error' }); }
 });
+
+// ===================================
+// PAYMENT ROUTES (Moyasar)
+// ===================================
+function moyasarConfigured() {
+    return process.env.MOYASAR_API_KEY && !process.env.MOYASAR_API_KEY.includes('YOUR_KEY');
+}
+
+app.post('/api/payments/create', async (req, res) => {
+    try {
+        if (!moyasarConfigured()) {
+            return res.status(503).json({ error: 'Payment gateway not configured. Contact admin.' });
+        }
+        const { amount, currency = 'SAR', description, callback_url, metadata } = req.body;
+        if (!amount || amount <= 0) return res.status(400).json({ error: 'Invalid amount' });
+
+        const response = await axios.post(
+            'https://api.moyasar.com/v1/payments',
+            {
+                amount: Math.round(amount * 100),
+                currency,
+                description,
+                callback_url: callback_url || `${process.env.FRONTEND_URL}/order-success`,
+                source: { type: 'creditcard' },
+                metadata,
+            },
+            { auth: { username: process.env.MOYASAR_API_KEY, password: '' } }
+        );
+        res.json({ payment_id: response.data.id, payment_url: response.data.source?.transaction_url, status: response.data.status });
+    } catch (error) {
+        console.error('Payment create error:', error.response?.data || error.message);
+        res.status(500).json({ error: 'فشل إنشاء جلسة الدفع' });
+    }
+});
+
+app.get('/api/payments/verify/:payment_id', async (req, res) => {
+    try {
+        if (!moyasarConfigured()) return res.status(503).json({ error: 'Payment gateway not configured' });
+
+        const response = await axios.get(
+            `https://api.moyasar.com/v1/payments/${req.params.payment_id}`,
+            { auth: { username: process.env.MOYASAR_API_KEY, password: '' } }
+        );
+        const payment = response.data;
+        if (payment.status === 'paid' && payment.metadata?.order_id) {
+            await pool.query(
+                `UPDATE orders SET payment_status='paid', payment_transaction_id=$1, paid_at=NOW(), status='processing', updated_at=NOW() WHERE id=$2 AND payment_status != 'paid'`,
+                [req.params.payment_id, payment.metadata.order_id]
+            );
+        }
+        res.json({ status: payment.status, amount: payment.amount / 100, currency: payment.currency, order_id: payment.metadata?.order_id });
+    } catch (error) {
+        console.error('Payment verify error:', error.response?.data || error.message);
+        res.status(500).json({ error: 'فشل التحقق من الدفع' });
+    }
+});
+
+// Webhook — signature is REQUIRED. Without MOYASAR_WEBHOOK_SECRET set,
+// anyone could POST a forged "payment.paid" event and mark any order paid.
+app.post('/api/payments/webhook', async (req, res) => {
+    try {
+        const webhookSecret = process.env.MOYASAR_WEBHOOK_SECRET;
+        if (!webhookSecret) {
+            console.error('❌ MOYASAR_WEBHOOK_SECRET not set — rejecting webhook');
+            return res.status(500).json({ error: 'Webhook not configured' });
+        }
+
+        const signature = req.headers['x-moyasar-signature'] || req.headers['x-webhook-signature'];
+        if (!signature || !req.rawBody) {
+            return res.status(401).json({ error: 'Missing signature' });
+        }
+
+        const expected = crypto.createHmac('sha256', webhookSecret).update(req.rawBody).digest('hex');
+        const sigBuf = Buffer.from(signature);
+        const expBuf = Buffer.from(expected);
+        if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+            return res.status(401).json({ error: 'Invalid signature' });
+        }
+
+        const { type, data } = req.body;
+        if (type === 'payment.paid' && data?.metadata?.order_id) {
+            await pool.query(
+                `UPDATE orders SET payment_status='paid', payment_transaction_id=$1, paid_at=NOW(), status='processing', updated_at=NOW() WHERE id=$2 AND payment_status != 'paid'`,
+                [data.id, data.metadata.order_id]
+            );
+        }
+        res.json({ received: true });
+    } catch (error) {
+        console.error('Webhook error:', error);
+        res.status(500).json({ error: 'Webhook failed' });
+    }
+});
+
+// ===================================
+// Error Handlers
+// ===================================
+app.use((err, req, res, next) => {
+    console.error('Error:', err);
+    if (err.code === 'LIMIT_FILE_SIZE') return res.status(400).json({ error: 'File too large. Max 5MB.' });
+    res.status(500).json({ error: 'Internal server error' });
+});
+
+app.use((req, res) => res.status(404).json({ error: `Route not found: ${req.method} ${req.path}` }));
+
+// ===================================
+// Start
+// ===================================
+startServer();
